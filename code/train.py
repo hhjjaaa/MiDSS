@@ -64,6 +64,7 @@ parser.add_argument('--dropout', type=float, default=0.0)
 
 parser.add_argument("--cutmix_prob", default=1.0, type=float)
 parser.add_argument("--LB", default=0.01, type=float)
+parser.add_argument("--disable_cutmix", action="store_true", help="Disable CutMix-style mixing for ablation.")
 args = parser.parse_args()
 
 
@@ -412,6 +413,7 @@ def train(args, snapshot_path):
 
     iter_num = int(iter_num)
     threshold = args.threshold
+    use_cutmix = (not args.disable_cutmix) and args.cutmix_prob > 0
 
     if args.load:
         path_str = '../model/prostate/dm{}/checkpoint.pth'.format(args.lb_domain)
@@ -437,15 +439,17 @@ def train(args, snapshot_path):
             ulb_x_w, ulb_x_s, ulb_y = ulb_sample['image'], ulb_sample['strong_aug'], ulb_sample['label']
             lb_dc, ulb_dc = lb_sample['dc'].cuda(), ulb_sample['dc'].cuda()
             
-            move_transx = []
-            for i in range(len(lb_x_w)):
-                amp_trg = extract_amp_spectrum((ulb_x_w[i].numpy()+1)*127.5)
-                img_freq = source_to_target_freq(((lb_x_w[i]+1)*127.5).numpy(), amp_trg, L=args.LB, degree=iter_num/max_iterations)
-                img_freq = np.clip(img_freq, 0, 255).astype(np.float32)
-                move_transx.append(img_freq)
-            move_transx = torch.tensor(np.array(move_transx), dtype=torch.float32)
-            move_transx = move_transx/127.5 -1
-            move_transx = move_transx.cuda()
+            move_transx = None
+            if use_cutmix:
+                move_transx_list = []
+                for i in range(len(lb_x_w)):
+                    amp_trg = extract_amp_spectrum((ulb_x_w[i].numpy()+1)*127.5)
+                    img_freq = source_to_target_freq(((lb_x_w[i]+1)*127.5).numpy(), amp_trg, L=args.LB, degree=iter_num/max_iterations)
+                    img_freq = np.clip(img_freq, 0, 255).astype(np.float32)
+                    move_transx_list.append(img_freq)
+                move_transx = torch.tensor(np.array(move_transx_list), dtype=torch.float32)
+                move_transx = move_transx/127.5 -1
+                move_transx = move_transx.cuda()
 
             lb_x_w, lb_y, ulb_x_w, ulb_x_s, ulb_y = lb_x_w.cuda(), lb_y.cuda(), ulb_x_w.cuda(), ulb_x_s.cuda(), ulb_y.cuda()
             if args.dataset == 'fundus':
@@ -461,59 +465,64 @@ def train(args, snapshot_path):
 
             with amp_cm():
                 with torch.no_grad():
-                    label_box = torch.stack([obtain_cutmix_box(img_size=patch_size, p=args.cutmix_prob) for i in range(len(ulb_x_s))], dim=0)
-                    img_box = label_box.unsqueeze(1)
-                    if args.dataset == 'fundus':
-                        label_box = label_box.unsqueeze(1)
                     logits_ulb_x_w = ema_model(ulb_x_w)
-                    ulb_x_w_ul = ulb_x_w * (1-img_box) + lb_x_w * img_box
-                    logits_w_ul = ema_model(ulb_x_w_ul)
-                    ulb_x_w_lu = lb_x_w * (1-img_box) + ulb_x_w * img_box
-                    logits_w_lu = ema_model(ulb_x_w_lu)
+                    if use_cutmix:
+                        label_box = torch.stack([obtain_cutmix_box(img_size=patch_size, p=args.cutmix_prob) for i in range(len(ulb_x_s))], dim=0)
+                        img_box = label_box.unsqueeze(1)
+                        if args.dataset == 'fundus':
+                            label_box = label_box.unsqueeze(1)
+                        ulb_x_w_ul = ulb_x_w * (1-img_box) + lb_x_w * img_box
+                        logits_w_ul = ema_model(ulb_x_w_ul)
+                        ulb_x_w_lu = lb_x_w * (1-img_box) + ulb_x_w * img_box
+                        logits_w_lu = ema_model(ulb_x_w_lu)
                     if args.dataset == 'fundus':
                         prob = logits_ulb_x_w.sigmoid()
                         pseudo_label = prob.ge(0.5).float()
                         mask = prob.ge(threshold).float() + prob.le(1-threshold).float()
-                        prob_w_ul = logits_w_ul.sigmoid()
-                        pseudo_label_w_ul = prob_w_ul.ge(0.5).float()
-                        mask_w_ul = prob_w_ul.ge(threshold).float() + prob_w_ul.le(1-threshold).float()
-                        prob_w_lu = logits_w_lu.sigmoid()
-                        pseudo_label_w_lu = prob_w_lu.ge(0.5).float()
-                        mask_w_lu = prob_w_lu.ge(threshold).float() + prob_w_lu.le(1-threshold).float()
+                        if use_cutmix:
+                            prob_w_ul = logits_w_ul.sigmoid()
+                            pseudo_label_w_ul = prob_w_ul.ge(0.5).float()
+                            mask_w_ul = prob_w_ul.ge(threshold).float() + prob_w_ul.le(1-threshold).float()
+                            prob_w_lu = logits_w_lu.sigmoid()
+                            pseudo_label_w_lu = prob_w_lu.ge(0.5).float()
+                            mask_w_lu = prob_w_lu.ge(threshold).float() + prob_w_lu.le(1-threshold).float()
                     elif args.dataset == 'prostate':
                         prob_ulb_x_w = torch.softmax(logits_ulb_x_w, dim=1)
                         prob, pseudo_label = torch.max(prob_ulb_x_w, dim=1)
                         mask = (prob > threshold).unsqueeze(1).float()
-                        prob_w_ul = torch.softmax(logits_w_ul, dim=1)
-                        conf_w_ul, pseudo_label_w_ul = torch.max(prob_w_ul, dim=1)
-                        mask_w_ul = (conf_w_ul > threshold).unsqueeze(1).float()
-                        prob_w_lu = torch.softmax(logits_w_lu, dim=1)
-                        conf_w_lu, pseudo_label_w_lu = torch.max(prob_w_lu, dim=1)
-                        mask_w_lu = (conf_w_lu > threshold).unsqueeze(1).float()
+                        if use_cutmix:
+                            prob_w_ul = torch.softmax(logits_w_ul, dim=1)
+                            conf_w_ul, pseudo_label_w_ul = torch.max(prob_w_ul, dim=1)
+                            mask_w_ul = (conf_w_ul > threshold).unsqueeze(1).float()
+                            prob_w_lu = torch.softmax(logits_w_lu, dim=1)
+                            conf_w_lu, pseudo_label_w_lu = torch.max(prob_w_lu, dim=1)
+                            mask_w_lu = (conf_w_lu > threshold).unsqueeze(1).float()
 
-                    mask_w = mask_w_ul * (1-img_box) + mask_w_lu * img_box
-                    pseudo_label_w = (pseudo_label_w_ul * (1-label_box) + pseudo_label_w_lu * label_box).long()
-                    if args.dataset == 'fundus':
-                        pseudo_label_w = pseudo_label_w.float()
-                        ensemble = (pseudo_label_w == pseudo_label).float() * mask
-                    elif args.dataset == 'prostate':
-                        ensemble = (pseudo_label_w == pseudo_label).unsqueeze(1).float() * mask
-                    mask_w[ensemble == 0] = 0
+                    if use_cutmix:
+                        mask_w = mask_w_ul * (1-img_box) + mask_w_lu * img_box
+                        pseudo_label_w = (pseudo_label_w_ul * (1-label_box) + pseudo_label_w_lu * label_box).long()
+                        if args.dataset == 'fundus':
+                            pseudo_label_w = pseudo_label_w.float()
+                            ensemble = (pseudo_label_w == pseudo_label).float() * mask
+                        elif args.dataset == 'prostate':
+                            ensemble = (pseudo_label_w == pseudo_label).unsqueeze(1).float() * mask
+                        mask_w[ensemble == 0] = 0
 
-                mask_ul, mask_lu = mask.clone(), mask.clone()
-                ulb_x_s_ul = ulb_x_s * (1-img_box) + move_transx * img_box
-                pseudo_label_ul = (pseudo_label * (1-label_box) + lb_mask * label_box).long()
-                mask_ul[img_box.expand(mask_ul.shape) == 1] = 1
-                ulb_x_s_lu = move_transx * (1-img_box) + ulb_x_s * img_box
-                pseudo_label_lu = (lb_mask * (1-label_box) + pseudo_label * label_box).long()
-                if args.dataset == 'fundus':
-                    pseudo_label_ul = pseudo_label_ul.float()
-                    pseudo_label_lu = pseudo_label_lu.float()
-                mask_lu[img_box.expand(mask_lu.shape) == 0] = 1
-                # outputs for model
                 logits_lb_x_w = model(lb_x_w)
-                logits_ulb_x_s_ul = model(ulb_x_s_ul)
-                logits_ulb_x_s_lu = model(ulb_x_s_lu)
+
+                if use_cutmix:
+                    mask_ul, mask_lu = mask.clone(), mask.clone()
+                    ulb_x_s_ul = ulb_x_s * (1-img_box) + move_transx * img_box
+                    pseudo_label_ul = (pseudo_label * (1-label_box) + lb_mask * label_box).long()
+                    mask_ul[img_box.expand(mask_ul.shape) == 1] = 1
+                    ulb_x_s_lu = move_transx * (1-img_box) + ulb_x_s * img_box
+                    pseudo_label_lu = (lb_mask * (1-label_box) + pseudo_label * label_box).long()
+                    if args.dataset == 'fundus':
+                        pseudo_label_ul = pseudo_label_ul.float()
+                        pseudo_label_lu = pseudo_label_lu.float()
+                    mask_lu[img_box.expand(mask_lu.shape) == 0] = 1
+                    logits_ulb_x_s_ul = model(ulb_x_s_ul)
+                    logits_ulb_x_s_lu = model(ulb_x_s_lu)
                 logits_ulb_x_s = model(ulb_x_s)
 
                 sup_loss = ce_loss(logits_lb_x_w, lb_mask).mean() + \
@@ -522,14 +531,26 @@ def train(args, snapshot_path):
                 consistency_weight = get_current_consistency_weight(
                     iter_num // (args.max_iterations/args.consistency_rampup))
 
-                unsup_loss_ul = (ce_loss(logits_ulb_x_s_ul, pseudo_label_ul) * mask_ul.squeeze(1)).mean() + \
-                                dice_loss(logits_ulb_x_s_ul, pseudo_label_ul.unsqueeze(1), mask=mask_ul, softmax=softmax, sigmoid=sigmoid, multi=multi)
+                unsup_loss_ul = 0.0
+                unsup_loss_lu = 0.0
+                if use_cutmix:
+                    unsup_loss_ul = (ce_loss(logits_ulb_x_s_ul, pseudo_label_ul) * mask_ul.squeeze(1)).mean() + \
+                                    dice_loss(logits_ulb_x_s_ul, pseudo_label_ul.unsqueeze(1), mask=mask_ul, softmax=softmax, sigmoid=sigmoid, multi=multi)
 
-                unsup_loss_lu = (ce_loss(logits_ulb_x_s_lu, pseudo_label_lu) * mask_lu.squeeze(1)).mean() + \
-                                dice_loss(logits_ulb_x_s_lu, pseudo_label_lu.unsqueeze(1), mask=mask_lu, softmax=softmax, sigmoid=sigmoid, multi=multi)
+                    unsup_loss_lu = (ce_loss(logits_ulb_x_s_lu, pseudo_label_lu) * mask_lu.squeeze(1)).mean() + \
+                                    dice_loss(logits_ulb_x_s_lu, pseudo_label_lu.unsqueeze(1), mask=mask_lu, softmax=softmax, sigmoid=sigmoid, multi=multi)
 
-                unsup_loss_s = (ce_loss(logits_ulb_x_s, pseudo_label_w) * mask_w.squeeze(1)).mean() + \
-                                dice_loss(logits_ulb_x_s, pseudo_label_w.unsqueeze(1), mask=mask_w, softmax=softmax, sigmoid=sigmoid, multi=multi)
+                if use_cutmix:
+                    unsup_loss_s = (ce_loss(logits_ulb_x_s, pseudo_label_w) * mask_w.squeeze(1)).mean() + \
+                                    dice_loss(logits_ulb_x_s, pseudo_label_w.unsqueeze(1), mask=mask_w, softmax=softmax, sigmoid=sigmoid, multi=multi)
+                else:
+                    if args.dataset == 'fundus':
+                        pseudo_label_w = pseudo_label.float()
+                    elif args.dataset == 'prostate':
+                        pseudo_label_w = pseudo_label.unsqueeze(1).long()
+                    mask_w = mask
+                    unsup_loss_s = (ce_loss(logits_ulb_x_s, pseudo_label_w) * mask_w.squeeze(1)).mean() + \
+                                    dice_loss(logits_ulb_x_s, pseudo_label_w.unsqueeze(1), mask=mask_w, softmax=softmax, sigmoid=sigmoid, multi=multi)
 
                 loss = sup_loss + consistency_weight * (unsup_loss_ul + unsup_loss_lu + consistency_weight * unsup_loss_s)
 
